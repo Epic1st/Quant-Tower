@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "quantower_algo/1.0.0": {
+        "runtime": {
+          "quantower_algo.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "quantower_algo/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
