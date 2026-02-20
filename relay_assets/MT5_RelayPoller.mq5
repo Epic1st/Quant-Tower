@@ -3,8 +3,11 @@
 #include <Trade/Trade.mqh>
 
 input string RelayBaseUrl = "http://127.0.0.1:8000";
-input string RelaySecret = "<RELAY_SECRET>";
+input string RelaySecret = "";
 input int PollSeconds = 1;
+input bool PersistLastSignalId = true;
+input bool EnableRelayFailureAlert = true;
+input int RelayFailureAlertThreshold = 5;
 
 input string RelayFuturesSymbol = "/GCJ26:XCEC";
 input string DefaultTradeSymbol = "XAUUSD";
@@ -24,6 +27,7 @@ input bool DryRunOnly = false;
 
 CTrade g_trade;
 int g_last_id = 0;
+int g_consecutive_poll_failures = 0;
 
 bool IsWhitespace(const int c)
 {
@@ -151,6 +155,197 @@ string ToUpperSafe(string text)
    return text;
 }
 
+bool IsSecretConfigured(const string secret)
+{
+   string s = secret;
+   StringTrimLeft(s);
+   StringTrimRight(s);
+   if (s == "")
+      return false;
+   return (StringCompare(s, "<RELAY_SECRET>", false) != 0);
+}
+
+string LastIdGlobalKey()
+{
+   long login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
+   return StringFormat("relay_single_last_id_%I64d", login);
+}
+
+void SaveLastSignalId()
+{
+   if (!PersistLastSignalId)
+      return;
+
+   string key = LastIdGlobalKey();
+   double current = 0.0;
+   if (GlobalVariableCheck(key))
+      current = GlobalVariableGet(key);
+
+   if ((double)g_last_id >= current)
+      GlobalVariableSet(key, (double)g_last_id);
+}
+
+void LoadLastSignalId()
+{
+   if (!PersistLastSignalId)
+      return;
+
+   string key = LastIdGlobalKey();
+   if (!GlobalVariableCheck(key))
+      return;
+
+   int persisted = (int)MathRound(GlobalVariableGet(key));
+   if (persisted > g_last_id)
+   {
+      g_last_id = persisted;
+      PrintFormat("Loaded persisted last signal id=%d", g_last_id);
+   }
+}
+
+void AdvanceLastId(const int signalId)
+{
+   if (signalId > g_last_id)
+      g_last_id = signalId;
+   SaveLastSignalId();
+}
+
+void TrackRelayPollFailure(const string reason)
+{
+   g_consecutive_poll_failures++;
+   if (!EnableRelayFailureAlert)
+      return;
+
+   int threshold = RelayFailureAlertThreshold;
+   if (threshold < 1)
+      threshold = 1;
+
+   if (g_consecutive_poll_failures == threshold ||
+       (g_consecutive_poll_failures > threshold && (g_consecutive_poll_failures % threshold) == 0))
+   {
+      string msg = StringFormat("Relay poll failures=%d. Last error: %s", g_consecutive_poll_failures, reason);
+      Print(msg);
+      Alert(msg);
+   }
+}
+
+void ResetRelayPollFailureState()
+{
+   g_consecutive_poll_failures = 0;
+}
+
+bool IsAsciiLetter(const int ch)
+{
+   return (ch >= 'A' && ch <= 'Z');
+}
+
+string ExtractFuturesRoot(const string symbolText)
+{
+   string sym = ToUpperSafe(symbolText);
+   int n = StringLen(sym);
+   int p = 0;
+
+   while (p < n && (StringGetCharacter(sym, p) == ' ' || StringGetCharacter(sym, p) == '\t'))
+      p++;
+
+   if (p < n && StringGetCharacter(sym, p) == '/')
+      p++;
+
+   int start = p;
+   while (p < n)
+   {
+      int ch = StringGetCharacter(sym, p);
+      if (!IsAsciiLetter(ch))
+         break;
+      p++;
+   }
+
+   if (p <= start)
+      return "";
+
+   return StringSubstr(sym, start, p - start);
+}
+
+string NormalizeGoldRoot(const string symbolText)
+{
+   string root = ExtractFuturesRoot(symbolText);
+   if (root == "")
+      return "";
+
+   if (StringLen(root) >= 3 && StringSubstr(root, 0, 3) == "MGC")
+      return "MGC";
+
+   if (StringLen(root) >= 2 && StringSubstr(root, 0, 2) == "GC")
+      return "GC";
+
+   return root;
+}
+
+bool IsGoldSymbolLike(const string symbolText)
+{
+   string sym = ToUpperSafe(symbolText);
+   if (sym == "")
+      return false;
+
+   if (StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0)
+      return true;
+
+   string root = NormalizeGoldRoot(sym);
+   if (root == "GC" || root == "MGC")
+      return true;
+
+   return false;
+}
+
+bool IsRelaySymbolMatch(const string sourceSymbol)
+{
+   if (sourceSymbol == "")
+      return false;
+
+   if (RelayFuturesSymbol == "")
+      return IsGoldSymbolLike(sourceSymbol);
+
+   if (StringCompare(sourceSymbol, RelayFuturesSymbol, false) == 0)
+      return true;
+
+   string sourceRoot = NormalizeGoldRoot(sourceSymbol);
+   string relayRoot = NormalizeGoldRoot(RelayFuturesSymbol);
+   if (sourceRoot != "" && relayRoot != "" && sourceRoot == relayRoot)
+      return true;
+
+   return false;
+}
+
+string UrlEncode(const string value)
+{
+   string encoded = "";
+   int n = StringLen(value);
+
+   for (int i = 0; i < n; i++)
+   {
+      int ch = StringGetCharacter(value, i);
+      bool safe =
+         (ch >= 'a' && ch <= 'z') ||
+         (ch >= 'A' && ch <= 'Z') ||
+         (ch >= '0' && ch <= '9') ||
+         ch == '-' || ch == '_' || ch == '.' || ch == '~';
+
+      if (safe)
+      {
+         encoded += ShortToString((ushort)ch);
+      }
+      else if (ch >= 0 && ch <= 255)
+      {
+         encoded += "%" + StringFormat("%02X", ch);
+      }
+      else
+      {
+         encoded += "%3F";
+      }
+   }
+
+   return encoded;
+}
+
 string ResolveTradeSymbol(const string payloadSymbol, const string payloadTradeSymbol)
 {
    if (UseChartSymbolForExecution)
@@ -175,6 +370,18 @@ double GetTickSize(const string symbol)
    }
 
    return tickSize;
+}
+
+int TicksFromPercent(const double entryPrice, const double percent, const double tickSize)
+{
+   if (entryPrice <= 0.0 || percent <= 0.0 || tickSize <= 0.0)
+      return 0;
+
+   double distance = entryPrice * (percent / 100.0);
+   if (distance <= 0.0)
+      return 0;
+
+   return (int)MathMax(1.0, MathCeil(distance / tickSize));
 }
 
 void AdjustStopsForBroker(const string symbol,
@@ -348,6 +555,8 @@ bool ExecuteMarketSignal(const int signalId,
                          const string tradeSymbol,
                          const int slTicks,
                          const int tpTicks,
+                         const double slPercent,
+                         const double tpPercent,
                          const double riskLots,
                          const string signalComment)
 {
@@ -371,29 +580,53 @@ bool ExecuteMarketSignal(const int signalId,
    double price = 0.0;
    double sl = 0.0;
    double tp = 0.0;
+   int finalSlTicks = slTicks > 0 ? slTicks : DefaultSLTicks;
+   int finalTpTicks = tpTicks > 0 ? tpTicks : DefaultTPTicks;
 
    string sideUpper = ToUpperSafe(side);
 
    if (sideUpper == "BUY")
    {
       price = tick.ask;
-      if (slTicks > 0)
-         sl = NormalizeDouble(price - slTicks * tickSize, digits);
-      if (tpTicks > 0)
-         tp = NormalizeDouble(price + tpTicks * tickSize, digits);
    }
    else if (sideUpper == "SELL")
    {
       price = tick.bid;
-      if (slTicks > 0)
-         sl = NormalizeDouble(price + slTicks * tickSize, digits);
-      if (tpTicks > 0)
-         tp = NormalizeDouble(price - tpTicks * tickSize, digits);
    }
    else
    {
       PrintFormat("Signal id=%d rejected: unsupported side '%s'", signalId, side);
       return false;
+   }
+
+   if (slPercent > 0.0)
+   {
+      int pctTicks = TicksFromPercent(price, slPercent, tickSize);
+      if (pctTicks > 0)
+         finalSlTicks = pctTicks;
+   }
+
+   if (tpPercent > 0.0)
+   {
+      int pctTicks = TicksFromPercent(price, tpPercent, tickSize);
+      if (pctTicks > 0)
+         finalTpTicks = pctTicks;
+   }
+
+   if (finalSlTicks <= 0)
+      finalSlTicks = DefaultSLTicks;
+   if (finalTpTicks <= 0)
+      finalTpTicks = DefaultTPTicks;
+
+   if (sideUpper == "BUY")
+   {
+      sl = NormalizeDouble(price - finalSlTicks * tickSize, digits);
+      tp = NormalizeDouble(price + finalTpTicks * tickSize, digits);
+   }
+   else
+   {
+      sl = NormalizeDouble(price + finalSlTicks * tickSize, digits);
+      tp = NormalizeDouble(price - finalTpTicks * tickSize, digits);
    }
 
    AdjustStopsForBroker(tradeSymbol, sideUpper, tick.bid, tick.ask, sl, tp);
@@ -426,7 +659,7 @@ bool ExecuteMarketSignal(const int signalId,
       tp = 0.0;
 
       if (ok)
-         TryApplyPostFillStops(tradeSymbol, sideUpper, slTicks, tpTicks);
+         TryApplyPostFillStops(tradeSymbol, sideUpper, finalSlTicks, finalTpTicks);
    }
 
    if (ok)
@@ -450,11 +683,31 @@ void ProcessSignalPayload(const string body)
       return;
    }
 
+   int signalId = -1;
+   if (!JsonTryGetInt(body, "id", signalId))
+      return;
+
+   if (signalId < g_last_id)
+   {
+      int resyncId = signalId;
+      if (updated && signalId > 0)
+         resyncId = signalId - 1;
+      if (resyncId < 0)
+         resyncId = 0;
+
+      PrintFormat("Relay id rollback detected: local_last_id=%d relay_id=%d updated=%s -> resync_local_id=%d",
+                  g_last_id,
+                  signalId,
+                  (updated ? "true" : "false"),
+                  resyncId);
+      g_last_id = resyncId;
+      SaveLastSignalId();
+   }
+
    if (!updated)
       return;
 
-   int signalId = -1;
-   if (!JsonTryGetInt(body, "id", signalId) || signalId <= g_last_id)
+   if (signalId <= g_last_id)
       return;
 
    string side = "";
@@ -466,6 +719,10 @@ void ProcessSignalPayload(const string body)
    int slTicks = DefaultSLTicks;
    int tpTicks = DefaultTPTicks;
    double riskLots = DefaultRiskLots;
+   double slPercent = 0.0;
+   double tpPercent = 0.0;
+   double tp1Percent = 0.0;
+   double tp2Percent = 0.0;
 
    JsonTryGetString(body, "side", side);
    JsonTryGetString(body, "source", source);
@@ -475,6 +732,14 @@ void ProcessSignalPayload(const string body)
    JsonTryGetInt(body, "sl_ticks", slTicks);
    JsonTryGetInt(body, "tp_ticks", tpTicks);
    JsonTryGetDouble(body, "risk", riskLots);
+   JsonTryGetDouble(body, "sl_percent", slPercent);
+   if (!JsonTryGetDouble(body, "tp_percent", tpPercent))
+   {
+      if (JsonTryGetDouble(body, "tp2_percent", tp2Percent))
+         tpPercent = tp2Percent;
+      else if (JsonTryGetDouble(body, "tp1_percent", tp1Percent))
+         tpPercent = tp1Percent;
+   }
 
    side = ToUpperSafe(side);
    source = ToUpperSafe(source);
@@ -484,15 +749,23 @@ void ProcessSignalPayload(const string body)
       if (source != "QUANTOWER")
       {
          PrintFormat("Signal id=%d ignored: source=%s (expected quantower)", signalId, source);
-         g_last_id = signalId;
+         AdvanceLastId(signalId);
          return;
       }
 
-      if (sourceSymbol == "" || StringCompare(sourceSymbol, RelayFuturesSymbol, false) != 0)
+      if (!IsGoldSymbolLike(sourceSymbol))
       {
-         PrintFormat("Signal id=%d ignored: src_symbol=%s (expected %s)",
+         PrintFormat("Signal id=%d ignored: src_symbol=%s is not recognized as gold symbol",
+                     signalId, sourceSymbol);
+         AdvanceLastId(signalId);
+         return;
+      }
+
+      if (!IsRelaySymbolMatch(sourceSymbol))
+      {
+         PrintFormat("Signal id=%d ignored: src_symbol=%s does not match RelayFuturesSymbol/root=%s",
                      signalId, sourceSymbol, RelayFuturesSymbol);
-         g_last_id = signalId;
+         AdvanceLastId(signalId);
          return;
       }
    }
@@ -500,28 +773,28 @@ void ProcessSignalPayload(const string body)
    if (IgnoreNonRelayFuturesSymbol &&
        RelayFuturesSymbol != "" &&
        sourceSymbol != "" &&
-       StringCompare(sourceSymbol, RelayFuturesSymbol, false) != 0)
+       !IsRelaySymbolMatch(sourceSymbol))
    {
-      PrintFormat("Signal id=%d ignored: src_symbol=%s does not match RelayFuturesSymbol=%s",
+      PrintFormat("Signal id=%d ignored: src_symbol=%s does not match RelayFuturesSymbol/root=%s",
                   signalId, sourceSymbol, RelayFuturesSymbol);
-      g_last_id = signalId;
+      AdvanceLastId(signalId);
       return;
    }
 
    string tradeSymbol = ResolveTradeSymbol(sourceSymbol, payloadTradeSymbol);
 
-   PrintFormat("Signal received id=%d side=%s src_symbol=%s trade_symbol=%s sl_ticks=%d tp_ticks=%d risk=%.2f comment=%s",
-               signalId, side, sourceSymbol, tradeSymbol, slTicks, tpTicks, riskLots, comment);
+   PrintFormat("Signal received id=%d side=%s src_symbol=%s trade_symbol=%s sl_ticks=%d sl_percent=%.3f tp_ticks=%d tp_percent=%.3f risk=%.2f comment=%s",
+               signalId, side, sourceSymbol, tradeSymbol, slTicks, slPercent, tpTicks, tpPercent, riskLots, comment);
 
    if (DryRunOnly)
    {
       PrintFormat("DryRunOnly=true -> order not sent for signal id=%d", signalId);
-      g_last_id = signalId;
+      AdvanceLastId(signalId);
       return;
    }
 
-   bool ok = ExecuteMarketSignal(signalId, side, tradeSymbol, slTicks, tpTicks, riskLots, comment);
-   g_last_id = signalId;
+   bool ok = ExecuteMarketSignal(signalId, side, tradeSymbol, slTicks, tpTicks, slPercent, tpPercent, riskLots, comment);
+   AdvanceLastId(signalId);
 
    if (!ok)
       PrintFormat("Signal id=%d handled with trade failure (debounced to avoid duplicates).", signalId);
@@ -529,6 +802,13 @@ void ProcessSignalPayload(const string body)
 
 int OnInit()
 {
+   if (!IsSecretConfigured(RelaySecret))
+   {
+      Print("RelaySecret is missing/placeholder. Set a real shared secret in EA inputs.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   LoadLastSignalId();
    EventSetTimer(PollSeconds);
    g_trade.SetAsyncMode(false);
    PrintFormat("Relay poller started. chart_symbol=%s use_chart_symbol=%s filter_source=%s strict_gold_only=%s",
@@ -541,12 +821,13 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   SaveLastSignalId();
    EventKillTimer();
 }
 
 void OnTimer()
 {
-   string url = StringFormat("%s/signal?id=%d&auth=%s", RelayBaseUrl, g_last_id, RelaySecret);
+   string url = StringFormat("%s/signal?id=%d&auth=%s", RelayBaseUrl, g_last_id, UrlEncode(RelaySecret));
 
    char requestBody[];
    char responseBody[];
@@ -556,7 +837,10 @@ void OnTimer()
    int status = WebRequest("GET", url, "", 5000, requestBody, responseBody, responseHeaders);
    if (status == -1)
    {
-      PrintFormat("WebRequest failed err=%d", GetLastError());
+      int err = GetLastError();
+      string msg = StringFormat("WebRequest failed err=%d", err);
+      Print(msg);
+      TrackRelayPollFailure(msg);
       return;
    }
 
@@ -564,9 +848,12 @@ void OnTimer()
 
    if (status != 200)
    {
-      PrintFormat("Relay HTTP %d: %s", status, body);
+      string msg = StringFormat("Relay HTTP %d: %s", status, body);
+      Print(msg);
+      TrackRelayPollFailure(msg);
       return;
    }
 
+   ResetRelayPollFailureState();
    ProcessSignalPayload(body);
 }

@@ -4,6 +4,9 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using TradingPlatform.BusinessLayer;
 
 namespace RelaySignalStrategies;
@@ -17,7 +20,7 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     public string RelayUrl = "http://127.0.0.1:8000/signal";
 
     [InputParameter("RelaySecret", 2)]
-    public string RelaySecret = "<RELAY_SECRET>";
+    public string RelaySecret = string.Empty;
 
     [InputParameter("TradeSymbolForMT5", 3)]
     public string TradeSymbolForMT5 = "XAUUSD";
@@ -32,10 +35,10 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     public double risk = 0.25;
 
     [InputParameter("cooldownSeconds", 7, 1, 3600, 1, 0)]
-    public int cooldownSeconds = 60;
+    public int cooldownSeconds = 20;
 
     [InputParameter("lookbackMinutes", 8, 1, 240, 1, 0)]
-    public int lookbackMinutes = 15;
+    public int lookbackMinutes = 10;
 
     [InputParameter("supportBufferTicks", 9, 0, 100, 1, 0)]
     public int supportBufferTicks = 2;
@@ -53,7 +56,7 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     public int aggressionWindowSeconds = 10;
 
     [InputParameter("aggressionThreshold", 14, 1, 10000, 1, 0)]
-    public int aggressionThreshold = 20;
+    public int aggressionThreshold = 12;
 
     [InputParameter("ManualTrigger", 15)]
     public bool ManualTrigger = false;
@@ -71,16 +74,16 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     public int domLevels = 5;
 
     [InputParameter("domImbalanceThreshold", 20, 0.51, 0.95, 0.01, 2)]
-    public double domImbalanceThreshold = 0.58;
+    public double domImbalanceThreshold = 0.55;
 
     [InputParameter("largePrintMultiplier", 21, 1.0, 10.0, 0.1, 2)]
-    public double largePrintMultiplier = 2.5;
+    public double largePrintMultiplier = 2.0;
 
     [InputParameter("largePrintsThreshold", 22, 1, 200, 1, 0)]
-    public int largePrintsThreshold = 3;
+    public int largePrintsThreshold = 2;
 
     [InputParameter("absorptionPrintsThreshold", 23, 1, 200, 1, 0)]
-    public int absorptionPrintsThreshold = 6;
+    public int absorptionPrintsThreshold = 4;
 
     [InputParameter("volatilityLookbackBars", 24, 2, 120, 1, 0)]
     public int volatilityLookbackBars = 8;
@@ -95,10 +98,37 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     public int maxDynamicSlTicks = 220;
 
     [InputParameter("minRewardRisk", 28, 0.5, 5.0, 0.1, 2)]
-    public double minRewardRisk = 1.2;
+    public double minRewardRisk = 1.0;
 
     [InputParameter("maxRewardRisk", 29, 0.6, 10.0, 0.1, 2)]
-    public double maxRewardRisk = 2.8;
+    public double maxRewardRisk = 2.2;
+
+    [InputParameter("UsePercentTargetsForGold", 30)]
+    public bool UsePercentTargetsForGold = true;
+
+    [InputParameter("SlPercentOfGoldPrice", 31, 0.05, 5.0, 0.01, 2)]
+    public double SlPercentOfGoldPrice = 0.30;
+
+    [InputParameter("Tp1PercentOfGoldPrice", 32, 0.05, 10.0, 0.01, 2)]
+    public double Tp1PercentOfGoldPrice = 0.60;
+
+    [InputParameter("Tp2PercentOfGoldPrice", 33, 0.05, 20.0, 0.01, 2)]
+    public double Tp2PercentOfGoldPrice = 1.20;
+
+    [InputParameter("EnableFrequentTestSignals", 34)]
+    public bool EnableFrequentTestSignals = false;
+
+    [InputParameter("FrequentTestBarsInterval", 35, 1, 30, 1, 0)]
+    public int FrequentTestBarsInterval = 1;
+
+    [InputParameter("FrequentTestCooldownSeconds", 36, 1, 300, 1, 0)]
+    public int FrequentTestCooldownSeconds = 1;
+
+    [InputParameter("EnableRelayFailureAlert", 37)]
+    public bool EnableRelayFailureAlert = true;
+
+    [InputParameter("RelayFailureAlertThreshold", 38, 1, 100, 1, 0)]
+    public int RelayFailureAlertThreshold = 5;
 
     private Symbol? _symbol;
     private HistoricalData? _history;
@@ -123,6 +153,13 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     private DateTime _lastAutoSignalBarUtc = DateTime.MinValue;
 
     private bool _manualTriggerConsumed;
+    private readonly object _initGate = new();
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private int _relayFailureCount;
+    private Timer? _bootstrapTimer;
+    private DateTime _lastBootstrapLogUtc = DateTime.MinValue;
+    private bool _subscriptionsActive;
+    private bool _isStopping;
 
     public RelaySignal_GoldAbsorption()
     {
@@ -132,51 +169,44 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
 
     protected override void OnRun()
     {
+        _isStopping = false;
         _httpClient = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(3)
         };
 
-        _symbol = ResolveSymbol(SymbolName);
-        if (_symbol == null)
-        {
-            this.LogError($"Symbol not found: {SymbolName}. Add/subscribe the symbol in Quantower and restart strategy.");
-            return;
-        }
+        if (!IsSecretConfigured(RelaySecret))
+            this.LogError("RelaySecret is missing or placeholder. Set a real shared secret in strategy settings.");
 
-        var from = DateTime.UtcNow.AddMinutes(-Math.Max(lookbackMinutes * 2, 30));
-        _history = _symbol.GetHistory(Period.MIN1, from, DateTime.UtcNow);
-
-        _symbol.NewQuote += OnSymbolNewQuote;
-        _symbol.NewLast += OnSymbolNewLast;
-        _symbol.NewLevel2 += OnSymbolNewLevel2;
-
-        if (_history != null)
-        {
-            _history.NewHistoryItem += OnHistoryChanged;
-            _history.HistoryItemUpdated += OnHistoryChanged;
-        }
-
-        this.LogInfo($"Started on symbol={_symbol.Name}. RelayUrl={RelayUrl}. AutoMode={EnableAutoMode}. DynamicStops={UseDynamicStops}");
-
-        TryHandleManualTrigger(DateTime.UtcNow);
+        TryInitializeSymbolAndSubscriptions(logWaiting: true);
+        if (!_subscriptionsActive)
+            StartBootstrapTimer();
     }
 
     protected override void OnStop()
     {
-        if (_symbol != null)
-        {
-            _symbol.NewQuote -= OnSymbolNewQuote;
-            _symbol.NewLast -= OnSymbolNewLast;
-            _symbol.NewLevel2 -= OnSymbolNewLevel2;
-        }
+        _isStopping = true;
+        StopBootstrapTimer();
 
-        if (_history != null)
+        lock (_initGate)
         {
-            _history.NewHistoryItem -= OnHistoryChanged;
-            _history.HistoryItemUpdated -= OnHistoryChanged;
-            _history.Dispose();
-            _history = null;
+            if (_symbol != null)
+            {
+                _symbol.NewQuote -= OnSymbolNewQuote;
+                _symbol.NewLast -= OnSymbolNewLast;
+                _symbol.NewLevel2 -= OnSymbolNewLevel2;
+                _symbol = null;
+            }
+
+            if (_history != null)
+            {
+                _history.NewHistoryItem -= OnHistoryChanged;
+                _history.HistoryItemUpdated -= OnHistoryChanged;
+                _history.Dispose();
+                _history = null;
+            }
+
+            _subscriptionsActive = false;
         }
 
         _httpClient?.Dispose();
@@ -198,12 +228,99 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         if (!ManualTrigger)
             _manualTriggerConsumed = false;
 
+        if (!_subscriptionsActive)
+        {
+            TryInitializeSymbolAndSubscriptions(logWaiting: true);
+            if (!_subscriptionsActive)
+                StartBootstrapTimer();
+        }
+
         TryHandleManualTrigger(DateTime.UtcNow);
+    }
+
+    private void TryInitializeSymbolAndSubscriptions(bool logWaiting)
+    {
+        var initializedNow = false;
+        var boundSymbol = string.Empty;
+
+        lock (_initGate)
+        {
+            if (_subscriptionsActive || _isStopping)
+                return;
+
+            var resolved = ResolveSymbol(SymbolName);
+            if (resolved == null)
+            {
+                if (logWaiting && DateTime.UtcNow - _lastBootstrapLogUtc >= TimeSpan.FromSeconds(20))
+                {
+                    this.LogInfo($"Symbol '{SymbolName}' not available yet; waiting for connection/data.");
+                    _lastBootstrapLogUtc = DateTime.UtcNow;
+                }
+
+                return;
+            }
+
+            _symbol = resolved;
+            boundSymbol = _symbol.Name;
+
+            var from = DateTime.UtcNow.AddMinutes(-Math.Max(lookbackMinutes * 2, 30));
+            _history = _symbol.GetHistory(Period.MIN1, from, DateTime.UtcNow);
+
+            _symbol.NewQuote += OnSymbolNewQuote;
+            _symbol.NewLast += OnSymbolNewLast;
+            _symbol.NewLevel2 += OnSymbolNewLevel2;
+
+            if (_history != null)
+            {
+                _history.NewHistoryItem += OnHistoryChanged;
+                _history.HistoryItemUpdated += OnHistoryChanged;
+            }
+
+            _subscriptionsActive = true;
+            initializedNow = true;
+        }
+
+        if (!initializedNow)
+            return;
+
+        StopBootstrapTimer();
+        this.LogInfo($"Started on symbol={boundSymbol}. RelayUrl={RelayUrl}. AutoMode={EnableAutoMode}. DynamicStops={UseDynamicStops}");
+        TryHandleManualTrigger(DateTime.UtcNow);
+    }
+
+    private void StartBootstrapTimer()
+    {
+        if (_bootstrapTimer != null || _isStopping)
+            return;
+
+        _bootstrapTimer = new Timer(_ =>
+        {
+            if (_isStopping)
+                return;
+
+            TryInitializeSymbolAndSubscriptions(logWaiting: true);
+            if (_subscriptionsActive)
+                StopBootstrapTimer();
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5));
+    }
+
+    private void StopBootstrapTimer()
+    {
+        var timer = _bootstrapTimer;
+        _bootstrapTimer = null;
+        timer?.Dispose();
     }
 
     private void OnHistoryChanged(object sender, HistoryEventArgs e)
     {
-        // No-op: keeping handler attached ensures history stream remains hot for level calculations.
+        var now = DateTime.UtcNow;
+        TryHandleManualTrigger(now);
+        if (EnableAutoMode)
+        {
+            var price = GetCurrentPrice();
+            if (IsValidNumber(price) && price > 0)
+                TryEvaluateAuto(price, now);
+        }
     }
 
     private void OnSymbolNewQuote(Symbol symbol, Quote quote)
@@ -285,6 +402,12 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         if (_lastAutoSignalBarUtc == currentBarTimeUtc)
             return;
 
+        if (EnableFrequentTestSignals)
+        {
+            if (TryEvaluateFrequentTestSignals(currentPrice, nowUtc, currentBarTimeUtc, supportLevel, resistanceLevel))
+                return;
+        }
+
         var tickSize = GetTickSize();
         var supportBuffer = supportBufferTicks * tickSize;
         var breakDistance = breakTicks * tickSize;
@@ -331,6 +454,30 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         }
     }
 
+    private bool TryEvaluateFrequentTestSignals(double currentPrice, DateTime nowUtc, DateTime currentBarTimeUtc, double supportLevel, double resistanceLevel)
+    {
+        var interval = Math.Max(1, FrequentTestBarsInterval);
+        if ((currentBarTimeUtc.Minute % interval) != 0)
+            return false;
+
+        var midpoint = (supportLevel + resistanceLevel) * 0.5;
+        var side = currentPrice >= midpoint ? "BUY" : "SELL";
+        var anchor = side == "BUY" ? supportLevel : resistanceLevel;
+        if (!IsValidNumber(anchor))
+            anchor = currentPrice;
+
+        if (TrySendSignal(side, "test_mode_fast", nowUtc, isManual: false, currentPrice: currentPrice, anchorLevel: anchor))
+        {
+            _lastAutoSignalBarUtc = currentBarTimeUtc;
+            _pendingBuy = null;
+            _pendingSell = null;
+            _cooldownUntilUtc = nowUtc.AddSeconds(Math.Max(1, FrequentTestCooldownSeconds));
+            return true;
+        }
+
+        return false;
+    }
+
     private void ExpirePending(DateTime nowUtc)
     {
         var ttlSeconds = Math.Max(noProgressSeconds, aggressionWindowSeconds) + 5;
@@ -354,9 +501,8 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
 
         var barsToRead = Math.Min(Math.Max(lookbackMinutes, 1), _history.Count);
 
-        var minLow = double.MaxValue;
-        var maxHigh = double.MinValue;
-        var hasAny = false;
+        var lows = new List<double>(barsToRead);
+        var highs = new List<double>(barsToRead);
 
         for (var i = 0; i < barsToRead; i++)
         {
@@ -366,19 +512,16 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
             if (double.IsNaN(low) || double.IsInfinity(low) || double.IsNaN(high) || double.IsInfinity(high))
                 continue;
 
-            if (low < minLow)
-                minLow = low;
-            if (high > maxHigh)
-                maxHigh = high;
-
-            hasAny = true;
+            lows.Add(low);
+            highs.Add(high);
         }
 
-        if (!hasAny)
+        if (lows.Count == 0 || highs.Count == 0)
             return false;
 
-        supportLevel = minLow;
-        resistanceLevel = maxHigh;
+        TryComputeRobustLevels(lows, highs, GetTickSize(), out supportLevel, out resistanceLevel);
+        if (!IsValidNumber(supportLevel) || !IsValidNumber(resistanceLevel) || resistanceLevel <= supportLevel)
+            return false;
 
         try
         {
@@ -466,7 +609,8 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
 
     private void TrimQueues(DateTime nowUtc)
     {
-        var keepSeconds = Math.Max(Math.Max(aggressionWindowSeconds, noProgressSeconds), 30) + 30;
+        var keepSeconds = Math.Max(aggressionWindowSeconds, noProgressSeconds);
+        keepSeconds = Math.Max(keepSeconds, 20) + 15;
         var cutoff = nowUtc.AddSeconds(-keepSeconds);
 
         while (_aggressionSamples.Count > 0 && _aggressionSamples.Peek().TimeUtc < cutoff)
@@ -476,6 +620,15 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
             _recentPrices.Dequeue();
 
         while (_domSnapshots.Count > 0 && _domSnapshots.Peek().TimeUtc < cutoff)
+            _domSnapshots.Dequeue();
+
+        // Keep upper bounds to prevent runaway iteration cost on very high tick rates.
+        var maxSamples = Math.Max(1500, keepSeconds * 200);
+        while (_aggressionSamples.Count > maxSamples)
+            _aggressionSamples.Dequeue();
+        while (_recentPrices.Count > maxSamples)
+            _recentPrices.Dequeue();
+        while (_domSnapshots.Count > maxSamples)
             _domSnapshots.Dequeue();
     }
 
@@ -709,6 +862,21 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         if (IsValidNumber(_lastBid) && IsValidNumber(_lastAsk) && _lastBid > 0 && _lastAsk > 0)
             return (_lastBid + _lastAsk) * 0.5;
 
+        if (_recentPrices.Count > 0)
+        {
+            var latest = _recentPrices.Last().Price;
+            if (IsValidNumber(latest) && latest > 0)
+                return latest;
+        }
+
+        if (_history != null && _history.Count > 0)
+        {
+            var high = _history.High(0);
+            var low = _history.Low(0);
+            if (IsValidNumber(high) && IsValidNumber(low) && high >= low)
+                return (high + low) * 0.5;
+        }
+
         return double.NaN;
     }
 
@@ -717,9 +885,9 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         if (_httpClient == null || _symbol == null)
             return false;
 
-        if (string.IsNullOrWhiteSpace(RelayUrl) || string.IsNullOrWhiteSpace(RelaySecret))
+        if (string.IsNullOrWhiteSpace(RelayUrl) || !IsSecretConfigured(RelaySecret))
         {
-            this.LogError("RelayUrl or RelaySecret is empty. Signal not sent.");
+            this.LogError("RelayUrl or RelaySecret is invalid. Signal not sent.");
             return false;
         }
 
@@ -727,34 +895,64 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
             return false;
 
         var plan = BuildSignalPlan(side, reason, nowUtc, currentPrice, anchorLevel);
-        var payloadJson = BuildPayloadJson(side, reason, plan);
+        var payloadJson = BuildPayloadJson(side, reason, plan, currentPrice, GetTickSize());
 
+        _cooldownUntilUtc = nowUtc.AddSeconds(Math.Max(cooldownSeconds, 1));
+        _ = PostSignalAsync(side, reason, payloadJson, plan, currentPrice);
+        return true;
+    }
+
+    private async Task PostSignalAsync(string side, string reason, string payloadJson, SignalPlan plan, double currentPrice)
+    {
+        if (_httpClient == null || string.IsNullOrWhiteSpace(RelayUrl) || !IsSecretConfigured(RelaySecret))
+            return;
+
+        await _sendGate.WaitAsync().ConfigureAwait(false);
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, RelayUrl);
             request.Headers.Add("X-Auth", RelaySecret);
             request.Content = new StringContent(payloadJson, Encoding.UTF8, "application/json");
 
-            using var response = _httpClient.Send(request);
-            var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
                 this.LogError($"Signal POST failed. status={(int)response.StatusCode} side={side} reason={reason} body={body}");
-                return false;
+                TrackRelayFailure();
+                return;
             }
 
-            var id = TryExtractInt(body, "id", -1);
-            _cooldownUntilUtc = nowUtc.AddSeconds(Math.Max(cooldownSeconds, 1));
+            if (_relayFailureCount > 0)
+                this.LogInfo($"Relay post recovered after {_relayFailureCount} consecutive failures.");
+            _relayFailureCount = 0;
 
-            this.LogInfo($"Signal sent id={id} side={side} reason={reason} sl_ticks={plan.SlTicks} tp_ticks={plan.TpTicks} conf={plan.Confidence:F2} dom={plan.DomScore:F2}");
-            return true;
+            var id = TryExtractInt(body, "id", -1);
+            var slPct = TicksToPercent(plan.SlTicks, GetTickSize(), currentPrice);
+            var tpPct = TicksToPercent(plan.TpTicks, GetTickSize(), currentPrice);
+            this.LogInfo($"Signal sent id={id} side={side} reason={reason} sl_ticks={plan.SlTicks}({slPct:F3}%) tp_ticks={plan.TpTicks}({tpPct:F3}%) conf={plan.Confidence:F2} dom={plan.DomScore:F2}");
         }
         catch (Exception ex)
         {
             this.LogError($"Signal POST exception side={side} reason={reason}. {ex.GetType().Name}: {ex.Message}");
-            return false;
+            TrackRelayFailure();
         }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    private void TrackRelayFailure()
+    {
+        _relayFailureCount++;
+        if (!EnableRelayFailureAlert)
+            return;
+
+        var threshold = Math.Max(1, RelayFailureAlertThreshold);
+        if (_relayFailureCount == threshold || (_relayFailureCount > threshold && _relayFailureCount % threshold == 0))
+            this.LogError($"Relay connectivity warning: consecutive post failures={_relayFailureCount}");
     }
 
     private SignalPlan BuildSignalPlan(string side, string reason, DateTime nowUtc, double currentPrice, double anchorLevel)
@@ -802,34 +1000,87 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         var dynamicTp = (int)Math.Ceiling(dynamicSl * rr);
         dynamicTp = Math.Max(dynamicTp, (int)Math.Ceiling(dynamicSl * rrMin));
 
+        if (UsePercentTargetsForGold && IsValidNumber(currentPrice) && currentPrice > 0)
+        {
+            // Adaptive percent mode: percent distances remain gold-relative while tracking live structure.
+            var tickForPct = GetTickSize();
+            var baseSlPct = Math.Max(0.05, SlPercentOfGoldPrice);
+            var baseTp1Pct = Math.Max(baseSlPct + 0.01, Tp1PercentOfGoldPrice);
+            var baseTp2Pct = Math.Max(baseTp1Pct + 0.01, Tp2PercentOfGoldPrice);
+
+            var minSlPct = baseSlPct * 0.55;
+            var maxSlPct = baseSlPct * 2.50;
+            var minTpPct = baseTp1Pct * 0.55;
+            var maxTpPct = baseTp2Pct * 2.80;
+
+            var slDynamicPct = TicksToPercent(dynamicSl, tickForPct, currentPrice);
+            if (slDynamicPct <= 0)
+                slDynamicPct = baseSlPct;
+
+            var volFactor = ClampDouble(slDynamicPct / baseSlPct, 0.65, 1.75);
+            slDynamicPct = ClampDouble(slDynamicPct * volFactor, minSlPct, maxSlPct);
+
+            var tpDynamicPct = TicksToPercent(dynamicTp, tickForPct, currentPrice);
+            if (tpDynamicPct <= 0)
+                tpDynamicPct = baseTp2Pct * volFactor;
+
+            var rrPctFloor = slDynamicPct * rrMin;
+            tpDynamicPct = ClampDouble(tpDynamicPct, Math.Max(minTpPct, rrPctFloor), maxTpPct);
+
+            var slPctTicks = PercentToTicks(currentPrice, slDynamicPct, tickForPct);
+            var tpPctTicks = PercentToTicks(currentPrice, tpDynamicPct, tickForPct);
+
+            if (slPctTicks > 0)
+                dynamicSl = Clamp(slPctTicks, minSl, maxSl);
+
+            var rrFloor = (int)Math.Ceiling(dynamicSl * rrMin);
+            if (tpPctTicks > 0)
+                dynamicTp = tpPctTicks;
+
+            dynamicTp = Math.Max(dynamicTp, rrFloor);
+        }
+
         return new SignalPlan(dynamicSl, dynamicTp, confidence, domScore, aggressionCount, largePrintCount, absorptionScore);
     }
 
-    private string BuildPayloadJson(string side, string comment, SignalPlan plan)
+    private string BuildPayloadJson(string side, string comment, SignalPlan plan, double entryPrice, double tickSize)
     {
         var unix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var symbol = JsonEscape(SymbolName ?? string.Empty);
-        var tradeSymbol = JsonEscape(TradeSymbolForMT5 ?? string.Empty);
-        var sideEscaped = JsonEscape((side ?? string.Empty).ToUpperInvariant());
-        var commentEscaped = JsonEscape(comment ?? string.Empty);
-
-        return "{" +
-               "\"source\":\"quantower\"," +
-               $"\"symbol\":\"{symbol}\"," +
-               $"\"side\":\"{sideEscaped}\"," +
-               "\"order_type\":\"MARKET\"," +
-               $"\"sl_ticks\":{plan.SlTicks}," +
-               $"\"tp_ticks\":{plan.TpTicks}," +
-               $"\"risk\":{risk.ToString(CultureInfo.InvariantCulture)}," +
-               $"\"trade_symbol\":\"{tradeSymbol}\"," +
-               $"\"comment\":\"{commentEscaped}\"," +
-               $"\"confidence\":{plan.Confidence.ToString("F4", CultureInfo.InvariantCulture)}," +
-               $"\"dom_score\":{plan.DomScore.ToString("F4", CultureInfo.InvariantCulture)}," +
-               $"\"aggression_count\":{plan.AggressionCount}," +
-               $"\"large_prints\":{plan.LargePrintCount}," +
-               $"\"absorption_score\":{plan.AbsorptionScore.ToString("F4", CultureInfo.InvariantCulture)}," +
-               $"\"ts_client\":{unix}" +
-               "}";
+        var safeTick = IsValidNumber(tickSize) && tickSize > 0 ? tickSize : GetTickSize();
+        var safeEntry = IsValidNumber(entryPrice) && entryPrice > 0 ? entryPrice : GetCurrentPrice();
+        var tp1Ticks = Math.Max(1, (int)Math.Ceiling(plan.TpTicks * 0.5));
+        var tp2Ticks = Math.Max(tp1Ticks + 1, plan.TpTicks);
+        var slPercent = TicksToPercent(plan.SlTicks, safeTick, safeEntry);
+        var tp1Percent = TicksToPercent(tp1Ticks, safeTick, safeEntry);
+        var tp2Percent = TicksToPercent(tp2Ticks, safeTick, safeEntry);
+        var distanceMode = UsePercentTargetsForGold ? "percent" : "ticks";
+        var payload = new Dictionary<string, object?>
+        {
+            ["source"] = "quantower",
+            ["strategy_id"] = "S1",
+            ["symbol"] = SymbolName ?? string.Empty,
+            ["side"] = (side ?? string.Empty).ToUpperInvariant(),
+            ["order_type"] = "MARKET",
+            ["sl_ticks"] = plan.SlTicks,
+            ["tp1_ticks"] = tp1Ticks,
+            ["tp2_ticks"] = tp2Ticks,
+            ["tp_ticks"] = plan.TpTicks,
+            ["sl_percent"] = slPercent,
+            ["tp1_percent"] = tp1Percent,
+            ["tp2_percent"] = tp2Percent,
+            ["distance_mode"] = distanceMode,
+            ["entry_price"] = safeEntry,
+            ["risk"] = risk,
+            ["trade_symbol"] = TradeSymbolForMT5 ?? string.Empty,
+            ["comment"] = comment ?? string.Empty,
+            ["confidence"] = plan.Confidence,
+            ["dom_score"] = plan.DomScore,
+            ["aggression_count"] = plan.AggressionCount,
+            ["large_prints"] = plan.LargePrintCount,
+            ["absorption_score"] = plan.AbsorptionScore,
+            ["ts_client"] = unix
+        };
+        return JsonSerializer.Serialize(payload);
     }
 
     private static int TryExtractInt(string json, string key, int fallback)
@@ -876,7 +1127,46 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
             return exact;
 
         var contains = symbols.FirstOrDefault(s => s.Name != null && s.Name.IndexOf(symbolName, StringComparison.OrdinalIgnoreCase) >= 0);
-        return contains;
+        if (contains != null)
+            return contains;
+
+        var parts = symbolName.Split(':');
+        var left = parts.Length > 0 ? parts[0].Trim() : symbolName.Trim();
+        var exchange = parts.Length > 1 ? parts[1].Trim() : string.Empty;
+        var root = ExtractFuturesRoot(left);
+        if (string.IsNullOrEmpty(root))
+            return null;
+
+        var candidates = symbols.Where(s => !string.IsNullOrEmpty(s.Name) && s.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(exchange))
+            candidates = candidates.Where(s => s.Name.EndsWith($":{exchange}", StringComparison.OrdinalIgnoreCase));
+
+        return candidates.OrderBy(s => (s.Name ?? string.Empty).Length).FirstOrDefault();
+    }
+
+    private static string ExtractFuturesRoot(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var s = value.Trim();
+        var i = s.Length - 1;
+        var digitCount = 0;
+        while (i >= 0 && char.IsDigit(s[i]))
+        {
+            digitCount++;
+            i--;
+        }
+
+        if (digitCount == 0 || i < 0)
+            return string.Empty;
+
+        var month = char.ToUpperInvariant(s[i]);
+        const string futuresMonths = "FGHJKMNQUVXZ";
+        if (futuresMonths.IndexOf(month) < 0)
+            return string.Empty;
+
+        return i > 0 ? s.Substring(0, i) : string.Empty;
     }
 
     private string ParseSide(string manualSide)
@@ -902,7 +1192,89 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
     private static bool IsValidNumber(double value)
         => !double.IsNaN(value) && !double.IsInfinity(value);
 
+    private static bool IsSecretConfigured(string? secret)
+    {
+        if (string.IsNullOrWhiteSpace(secret))
+            return false;
+        return !string.Equals(secret.Trim(), "<RELAY_SECRET>", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void TryComputeRobustLevels(List<double> lows, List<double> highs, double tick, out double support, out double resistance)
+    {
+        support = lows != null && lows.Count > 0 ? lows.Min() : double.NaN;
+        resistance = highs != null && highs.Count > 0 ? highs.Max() : double.NaN;
+
+        if (lows == null || highs == null || lows.Count < 3 || highs.Count < 3)
+            return;
+
+        var swingLows = new List<double>();
+        var swingHighs = new List<double>();
+        var n = Math.Min(lows.Count, highs.Count);
+        var span = n >= 12 ? 2 : 1;
+
+        for (var i = span; i < n - span; i++)
+        {
+            var low = lows[i];
+            var high = highs[i];
+            var isSwingLow = true;
+            var isSwingHigh = true;
+
+            for (var k = 1; k <= span; k++)
+            {
+                if (!(low < lows[i - k] && low <= lows[i + k]))
+                    isSwingLow = false;
+                if (!(high > highs[i - k] && high >= highs[i + k]))
+                    isSwingHigh = false;
+            }
+
+            if (isSwingLow)
+                swingLows.Add(low);
+            if (isSwingHigh)
+                swingHighs.Add(high);
+        }
+
+        support = swingLows.Count >= 2 ? Quantile(swingLows, 0.5) : Quantile(lows, 0.2);
+        resistance = swingHighs.Count >= 2 ? Quantile(swingHighs, 0.5) : Quantile(highs, 0.8);
+
+        if (tick > 0 && IsValidNumber(support) && IsValidNumber(resistance) && resistance - support < 4 * tick)
+            resistance = support + 4 * tick;
+    }
+
+    private static int PercentToTicks(double entryPrice, double percent, double tickSize)
+    {
+        if (!IsValidNumber(entryPrice) || entryPrice <= 0 ||
+            !IsValidNumber(percent) || percent <= 0 ||
+            !IsValidNumber(tickSize) || tickSize <= 0)
+            return 0;
+
+        var distance = entryPrice * (percent / 100.0);
+        if (!IsValidNumber(distance) || distance <= 0)
+            return 0;
+
+        return Math.Max(1, (int)Math.Ceiling(distance / tickSize));
+    }
+
+    private static double TicksToPercent(int ticks, double tickSize, double entryPrice)
+    {
+        if (ticks <= 0 ||
+            !IsValidNumber(tickSize) || tickSize <= 0 ||
+            !IsValidNumber(entryPrice) || entryPrice <= 0)
+            return 0.0;
+
+        var distance = ticks * tickSize;
+        return distance / entryPrice * 100.0;
+    }
+
     private static int Clamp(int value, int min, int max)
+    {
+        if (value < min)
+            return min;
+        if (value > max)
+            return max;
+        return value;
+    }
+
+    private static double ClampDouble(double value, double min, double max)
     {
         if (value < min)
             return min;
@@ -920,16 +1292,25 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         return value;
     }
 
+    private static double Quantile(List<double> values, double q)
+    {
+        if (values == null || values.Count == 0)
+            return double.NaN;
+        var sorted = values.Where(IsValidNumber).OrderBy(x => x).ToList();
+        if (sorted.Count == 0)
+            return double.NaN;
+        q = ClampDouble(q, 0.0, 1.0);
+        var idx = (sorted.Count - 1) * q;
+        var lo = (int)Math.Floor(idx);
+        var hi = (int)Math.Ceiling(idx);
+        if (lo == hi)
+            return sorted[lo];
+        var w = idx - lo;
+        return sorted[lo] * (1.0 - w) + sorted[hi] * w;
+    }
+
     private static DateTime NormalizeMinute(DateTime t)
         => new DateTime(t.Year, t.Month, t.Day, t.Hour, t.Minute, 0, DateTimeKind.Utc);
-
-    private static string JsonEscape(string value)
-        => value
-            .Replace("\\", "\\\\")
-            .Replace("\"", "\\\"")
-            .Replace("\r", "\\r")
-            .Replace("\n", "\\n")
-            .Replace("\t", "\\t");
 
     private sealed class PendingSetup
     {

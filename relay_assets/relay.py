@@ -1,5 +1,6 @@
 import os
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,11 +12,19 @@ RELAY_SECRET = os.getenv("RELAY_SECRET", "")
 if not RELAY_SECRET:
     raise RuntimeError("RELAY_SECRET environment variable is required")
 
+RELAY_MAX_HISTORY = int(os.getenv("RELAY_MAX_HISTORY", "500"))
+if RELAY_MAX_HISTORY < 10:
+    RELAY_MAX_HISTORY = 10
+
 _state_lock = threading.Lock()
 _state: dict[str, Any] = {
     "id": 0,
     "ts": None,
     "payload": None,
+    "history": deque(maxlen=RELAY_MAX_HISTORY),
+    "poll_count": 0,
+    "last_poll_id": None,
+    "last_poll_ts": None,
 }
 
 
@@ -30,7 +39,16 @@ def _authorize(provided: str | None) -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "ts": _utc_iso()}
+    with _state_lock:
+        return {
+            "ok": True,
+            "ts": _utc_iso(),
+            "latest_id": int(_state["id"]),
+            "history_size": len(_state["history"]),
+            "poll_count": int(_state["poll_count"]),
+            "last_poll_id": _state["last_poll_id"],
+            "last_poll_ts": _state["last_poll_ts"],
+        }
 
 
 @app.post("/signal")
@@ -44,7 +62,16 @@ def post_signal(
         _state["id"] += 1
         _state["ts"] = _utc_iso()
         _state["payload"] = payload
-        snapshot = dict(_state)
+        record = {
+            "id": _state["id"],
+            "ts": _state["ts"],
+            "payload": payload,
+        }
+        _state["history"].append(record)
+        snapshot = {
+            "id": record["id"],
+            "ts": record["ts"],
+        }
 
     return {
         "ok": True,
@@ -61,21 +88,40 @@ def get_signal(
     _authorize(auth)
 
     with _state_lock:
-        snapshot = dict(_state)
+        _state["poll_count"] += 1
+        _state["last_poll_id"] = id
+        _state["last_poll_ts"] = _utc_iso()
 
-    if snapshot["id"] <= id:
+        latest_id = int(_state["id"])
+        latest_ts = _state["ts"]
+        latest_payload = _state["payload"]
+        history = list(_state["history"])
+
+    if latest_id <= id:
         return {
             "ok": True,
             "updated": False,
-            "id": snapshot["id"],
-            "ts": snapshot["ts"],
+            "id": latest_id,
+            "ts": latest_ts,
             "payload": None,
         }
 
+    # Return the earliest unseen signal so polling clients can consume ids sequentially.
+    for record in history:
+        if int(record["id"]) > id:
+            return {
+                "ok": True,
+                "updated": True,
+                "id": int(record["id"]),
+                "ts": record["ts"],
+                "payload": record["payload"],
+            }
+
+    # Fallback if history rolled over: return latest snapshot.
     return {
         "ok": True,
         "updated": True,
-        "id": snapshot["id"],
-        "ts": snapshot["ts"],
-        "payload": snapshot["payload"],
+        "id": latest_id,
+        "ts": latest_ts,
+        "payload": latest_payload,
     }
