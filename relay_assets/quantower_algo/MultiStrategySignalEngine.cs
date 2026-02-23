@@ -20,7 +20,7 @@ public sealed class MultiStrategySignalEngine : Strategy
     public string RelayUrl = "http://127.0.0.1:8000/signal";
 
     [InputParameter("RelaySecret", 2)]
-    public string RelaySecret = string.Empty;
+    public string RelaySecret = "<RELAY_SECRET>";
 
     [InputParameter("TradeSymbolForMT5", 3)]
     public string TradeSymbolForMT5 = "XAUUSD";
@@ -145,11 +145,20 @@ public sealed class MultiStrategySignalEngine : Strategy
     [InputParameter("CommentS13", 169)]
     public string CommentS13 = "S13_MTF_PULL";
 
+    [InputParameter("EnableS14", 200)]
+    public bool EnableS14 = true;
+
+    [InputParameter("RiskS14 (%)", 201, 0.01, 10.0, 0.01, 2)]
+    public double RiskS14 = 0.25;
+
+    [InputParameter("CommentS14", 202)]
+    public string CommentS14 = "S14_AGGR_CLUSTER";
+
     [InputParameter("orbBars", 170, 5, 180, 1, 0)]
     public int orbBars = 15;
 
     [InputParameter("cooldownSeconds", 14, 1, 3600, 1, 0)]
-    public int cooldownSeconds = 20;
+    public int cooldownSeconds = 10;
 
     [InputParameter("lookbackMinutes", 15, 10, 240, 1, 0)]
     public int lookbackMinutes = 15;
@@ -179,7 +188,7 @@ public sealed class MultiStrategySignalEngine : Strategy
     public int aggressionWindowSeconds = 10;
 
     [InputParameter("aggressionThreshold", 24, 1, 1000, 1, 0)]
-    public int aggressionThreshold = 12;
+    public int aggressionThreshold = 6;
 
     [InputParameter("pullWindowSeconds", 25, 1, 60, 1, 0)]
     public int pullWindowSeconds = 4;
@@ -229,7 +238,7 @@ public sealed class MultiStrategySignalEngine : Strategy
     [InputParameter("ManualTriggerAny", 40)]
     public bool ManualTriggerAny = false;
 
-    [InputParameter("ManualStrategyId (S1..S13)", 41)]
+    [InputParameter("ManualStrategyId (S1..S14)", 41)]
     public string ManualStrategyId = "S1";
 
     [InputParameter("ManualSideAny (BUY/SELL)", 42)]
@@ -298,7 +307,7 @@ public sealed class MultiStrategySignalEngine : Strategy
     [InputParameter("EnableFrequentTestSignals", 190)]
     public bool EnableFrequentTestSignals = false;
 
-    [InputParameter("FrequentTestStrategyId (S1..S13)", 191)]
+    [InputParameter("FrequentTestStrategyId (S1..S14)", 191)]
     public string FrequentTestStrategyId = "S1";
 
     [InputParameter("FrequentTestBarsInterval", 192, 1, 30, 1, 0)]
@@ -312,6 +321,12 @@ public sealed class MultiStrategySignalEngine : Strategy
 
     [InputParameter("RelayFailureAlertThreshold", 195, 1, 100, 1, 0)]
     public int RelayFailureAlertThreshold = 5;
+
+    [InputParameter("MaxSilenceSecondsBeforeFallback", 196, 30, 3600, 5, 0)]
+    public int MaxSilenceSecondsBeforeFallback = 300;
+
+    [InputParameter("SendGateWaitSeconds", 197, 1, 30, 1, 0)]
+    public int SendGateWaitSeconds = 5;
 
     private Symbol? _symbol;
     private HistoricalData? _history;
@@ -335,7 +350,8 @@ public sealed class MultiStrategySignalEngine : Strategy
         { "S10", new RuntimeState() },
         { "S11", new RuntimeState() },
         { "S12", new RuntimeState() },
-        { "S13", new RuntimeState() }
+        { "S13", new RuntimeState() },
+        { "S14", new RuntimeState() }
     };
 
     private double _lastBid = double.NaN;
@@ -347,22 +363,28 @@ public sealed class MultiStrategySignalEngine : Strategy
     private int _relayFailureCount;
     private Timer? _bootstrapTimer;
     private DateTime _lastBootstrapLogUtc = DateTime.MinValue;
+    private DateTime _lastAnySignalUtc = DateTime.MinValue;
+    private DateTime _lastHealthLogUtc = DateTime.MinValue;
+    private DateTime _lastFallbackOverrideLogUtc = DateTime.MinValue;
     private bool _subscriptionsActive;
     private bool _isStopping;
 
     public MultiStrategySignalEngine()
     {
         Name = nameof(MultiStrategySignalEngine);
-        Description = "S1-S13 multi strategy signal relay with dynamic zone SL/TP.";
+        Description = "S1-S14 multi strategy signal relay with dynamic zone SL/TP.";
     }
 
     protected override void OnRun()
     {
         _isStopping = false;
+        _lastAnySignalUtc = DateTime.UtcNow;
+        _lastHealthLogUtc = DateTime.MinValue;
+        _lastFallbackOverrideLogUtc = DateTime.MinValue;
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
 
         if (!IsSecretConfigured(RelaySecret))
-            this.LogError("RelaySecret is missing or placeholder. Set a real shared secret in strategy settings.");
+            this.LogError("RelaySecret is missing. Set RelaySecret in strategy settings.");
 
         TryInitializeSymbolAndSubscriptions(logWaiting: true);
         if (!_subscriptionsActive)
@@ -404,6 +426,9 @@ public sealed class MultiStrategySignalEngine : Strategy
         foreach (var st in _states.Values)
             st.Reset();
         _manualAnyConsumed = false;
+        _lastAnySignalUtc = DateTime.MinValue;
+        _lastHealthLogUtc = DateTime.MinValue;
+        _lastFallbackOverrideLogUtc = DateTime.MinValue;
 
         this.LogInfo("Stopped");
     }
@@ -597,7 +622,7 @@ public sealed class MultiStrategySignalEngine : Strategy
         {
             _manualAnyConsumed = true;
             ManualTriggerAny = false;
-            this.LogError($"ManualTriggerAny ignored: invalid ManualStrategyId='{ManualStrategyId}'. Expected S1..S13.");
+            this.LogError($"ManualTriggerAny ignored: invalid ManualStrategyId='{ManualStrategyId}'. Expected S1..S14.");
             return;
         }
 
@@ -635,7 +660,7 @@ public sealed class MultiStrategySignalEngine : Strategy
         if (!int.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n))
             return string.Empty;
 
-        return n >= 1 && n <= 13 ? $"S{n}" : string.Empty;
+        return n >= 1 && n <= 14 ? $"S{n}" : string.Empty;
     }
 
     private bool IsStrategyEnabled(string strategyId)
@@ -655,6 +680,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             "S11" => EnableS11,
             "S12" => EnableS12,
             "S13" => EnableS13,
+            "S14" => EnableS14,
             _ => false
         };
     }
@@ -667,6 +693,8 @@ public sealed class MultiStrategySignalEngine : Strategy
 
         if (!TryBuildContext(nowUtc, price, out var ctx))
             return;
+
+        MaybeLogSignalHealth(nowUtc);
 
         if (EnableS1)
             EvaluateS1(nowUtc, ctx);
@@ -694,6 +722,8 @@ public sealed class MultiStrategySignalEngine : Strategy
             EvaluateS12(nowUtc, ctx);
         if (EnableS13)
             EvaluateS13(nowUtc, ctx);
+        if (EnableS14)
+            EvaluateS14(nowUtc, ctx);
 
         if (EnableIndicatorFallback)
             EvaluateIndicatorFallback(nowUtc, ctx);
@@ -720,7 +750,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             {
                 var anchor = Math.Min(ctx.Support, ctx.BidWallPrice);
                 var near = ctx.Price >= anchor - buffer && ctx.Price <= anchor + buffer;
-                var execution = ctx.SellAggression >= aggressionThreshold && HasNoProgress(true, anchor, nowUtc, ctx.TickSize) && ComputeAbsorptionScore(true, anchor, nowUtc, ctx.TickSize) >= 0.45;
+                var execution = ctx.SellAggression >= aggressionThreshold && HasNoProgress(true, anchor, nowUtc, ctx.TickSize) && ComputeAbsorptionScore(true, anchor, nowUtc, ctx.TickSize) >= 0.25;
                 if (near && execution)
                     st.SetPending("BUY", anchor, "absorption_reversal", nowUtc);
             }
@@ -729,7 +759,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             {
                 var anchor = Math.Max(ctx.Resistance, ctx.AskWallPrice);
                 var near = ctx.Price >= anchor - buffer && ctx.Price <= anchor + buffer;
-                var execution = ctx.BuyAggression >= aggressionThreshold && HasNoProgress(false, anchor, nowUtc, ctx.TickSize) && ComputeAbsorptionScore(false, anchor, nowUtc, ctx.TickSize) >= 0.45;
+                var execution = ctx.BuyAggression >= aggressionThreshold && HasNoProgress(false, anchor, nowUtc, ctx.TickSize) && ComputeAbsorptionScore(false, anchor, nowUtc, ctx.TickSize) >= 0.25;
                 if (near && execution)
                     st.SetPending("SELL", anchor, "absorption_reversal", nowUtc);
             }
@@ -1047,6 +1077,83 @@ public sealed class MultiStrategySignalEngine : Strategy
             TrySendSignal("S13", "SELL", "mtf_pullback", nowUtc, ctx.Price, ctx.Vwap, false);
     }
 
+    private void EvaluateS14(DateTime nowUtc, Context ctx)
+    {
+        var st = _states["S14"];
+        if (!CanAutoSignal(st, ctx.BarTimeUtc, nowUtc))
+            return;
+
+        // S14: Large Aggressive Cluster – fires when concentrated aggressive
+        // volume appears at one price level (the green/red bubbles on DOM Surface).
+        // Uses the aggression queue to detect clusters within a short window.
+
+        var clusterWindowSec = Math.Max(2, aggressionWindowSeconds / 2);
+        var cutoff = nowUtc.AddSeconds(-clusterWindowSec);
+        var tickSize = ctx.TickSize;
+        if (!IsValid(tickSize) || tickSize <= 0) return;
+
+        // Bucket recent aggressive trades by price level (rounded to tick)
+        double totalBuyVol = 0, totalSellVol = 0;
+        var buyByLevel = new Dictionary<long, double>();
+        var sellByLevel = new Dictionary<long, double>();
+
+        foreach (var s in _aggr)
+        {
+            if (s.TimeUtc < cutoff) continue;
+            var level = (long)Math.Round(s.Price / tickSize);
+            if (s.IsBuy)
+            {
+                totalBuyVol += s.Size;
+                if (!buyByLevel.ContainsKey(level)) buyByLevel[level] = 0;
+                buyByLevel[level] += s.Size;
+            }
+            if (s.IsSell)
+            {
+                totalSellVol += s.Size;
+                if (!sellByLevel.ContainsKey(level)) sellByLevel[level] = 0;
+                sellByLevel[level] += s.Size;
+            }
+        }
+
+        // Need meaningful volume
+        var clusterThreshold = Math.Max(3, aggressionThreshold * 2);
+        if (totalBuyVol < clusterThreshold && totalSellVol < clusterThreshold)
+            return;
+
+        // Find the peak level where largest cluster sits
+        long peakBuyLevel = 0; double peakBuyVol = 0;
+        foreach (var kv in buyByLevel)
+            if (kv.Value > peakBuyVol) { peakBuyLevel = kv.Key; peakBuyVol = kv.Value; }
+
+        long peakSellLevel = 0; double peakSellVol = 0;
+        foreach (var kv in sellByLevel)
+            if (kv.Value > peakSellVol) { peakSellLevel = kv.Key; peakSellVol = kv.Value; }
+
+        // A cluster is significant when one level has >= 50% of total volume
+        // and total volume exceeds the threshold — this means many trades
+        // are hitting the same price = the big bubbles on the DOM Surface
+        var buyCluster = peakBuyVol >= clusterThreshold
+                         && totalBuyVol > 0
+                         && (double)peakBuyVol / totalBuyVol >= 0.40
+                         && ctx.DomImbalance >= 0.50;
+
+        var sellCluster = peakSellVol >= clusterThreshold
+                          && totalSellVol > 0
+                          && (double)peakSellVol / totalSellVol >= 0.40
+                          && ctx.DomImbalance <= 0.50;
+
+        if (buyCluster && peakBuyVol >= peakSellVol)
+        {
+            var anchor = peakBuyLevel * tickSize;
+            TrySendSignal("S14", "BUY", "aggr_cluster", nowUtc, ctx.Price, anchor, false);
+        }
+        else if (sellCluster && peakSellVol > peakBuyVol)
+        {
+            var anchor = peakSellLevel * tickSize;
+            TrySendSignal("S14", "SELL", "aggr_cluster", nowUtc, ctx.Price, anchor, false);
+        }
+    }
+
     private void EvaluateIndicatorFallback(DateTime nowUtc, Context ctx)
     {
         if (!EnableS1)
@@ -1057,8 +1164,15 @@ public sealed class MultiStrategySignalEngine : Strategy
             return;
 
         var orderflowCold = _aggr.Count < Math.Max(6, aggressionThreshold / 2) || _dom.Count < 2;
-        if (IndicatorFallbackOnlyWhenOrderflowCold && !orderflowCold)
+        var starvationOverride = IsSignalStarved(nowUtc);
+        if (IndicatorFallbackOnlyWhenOrderflowCold && !orderflowCold && !starvationOverride)
             return;
+
+        if (starvationOverride && !orderflowCold && nowUtc - _lastFallbackOverrideLogUtc >= TimeSpan.FromSeconds(30))
+        {
+            this.LogInfo($"Fallback override: no signal for {(int)(nowUtc - _lastAnySignalUtc).TotalSeconds}s, bypassing orderflow-cold gate.");
+            _lastFallbackOverrideLogUtc = nowUtc;
+        }
 
         if (!TryBuildIndicatorSnapshot(ctx, out var ind))
             return;
@@ -1743,7 +1857,14 @@ public sealed class MultiStrategySignalEngine : Strategy
         if (_http == null || string.IsNullOrWhiteSpace(RelayUrl) || !IsSecretConfigured(RelaySecret))
             return;
 
-        await _sendGate.WaitAsync().ConfigureAwait(false);
+        var gateWaitSeconds = Math.Max(1, SendGateWaitSeconds);
+        if (!await _sendGate.WaitAsync(TimeSpan.FromSeconds(gateWaitSeconds)).ConfigureAwait(false))
+        {
+            this.LogError($"POST gate timeout after {gateWaitSeconds}s strategy={strategyId} side={side}");
+            TrackRelayFailure();
+            return;
+        }
+
         try
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, RelayUrl);
@@ -1762,6 +1883,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             if (_relayFailureCount > 0)
                 this.LogInfo($"Relay post recovered after {_relayFailureCount} consecutive failures.");
             _relayFailureCount = 0;
+            _lastAnySignalUtc = DateTime.UtcNow;
 
             var id = TryExtractId(body);
             var slPct = TicksToPercent(plan.SlTicks, tickSize, entryPrice);
@@ -1978,6 +2100,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             "S11" => CommentS11,
             "S12" => CommentS12,
             "S13" => CommentS13,
+            "S14" => CommentS14,
             _ => strategyId
         };
 
@@ -1999,6 +2122,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             "sweep_reclaim" => "SWEEP_RECL",
             "delta_divergence" => "DELTA_DIV",
             "mtf_pullback" => "MTF_PULL",
+            "vwap_reversal" => "VWAP_REV",
             "indicator_stack" => "IND_STACK",
             "test_mode_fast" => "TEST_FAST",
             "manual_test" => "MANUAL",
@@ -2025,6 +2149,7 @@ public sealed class MultiStrategySignalEngine : Strategy
             "S11" => Math.Max(0.01, RiskS11),
             "S12" => Math.Max(0.01, RiskS12),
             "S13" => Math.Max(0.01, RiskS13),
+            "S14" => Math.Max(0.01, RiskS14),
             _ => 0.25
         };
     }
@@ -2048,7 +2173,35 @@ public sealed class MultiStrategySignalEngine : Strategy
 
     private bool CanAutoSignal(RuntimeState state, DateTime barTimeUtc, DateTime nowUtc)
     {
-        return nowUtc >= state.CooldownUntilUtc && state.LastSignalBarUtc != barTimeUtc;
+        return nowUtc >= state.CooldownUntilUtc;
+    }
+
+    private bool IsSignalStarved(DateTime nowUtc)
+    {
+        if (_lastAnySignalUtc == DateTime.MinValue)
+            return false;
+
+        var silenceThreshold = Math.Max(30, MaxSilenceSecondsBeforeFallback);
+        return (nowUtc - _lastAnySignalUtc).TotalSeconds >= silenceThreshold;
+    }
+
+    private void MaybeLogSignalHealth(DateTime nowUtc)
+    {
+        if (_lastAnySignalUtc == DateTime.MinValue)
+            return;
+
+        if (nowUtc - _lastHealthLogUtc < TimeSpan.FromMinutes(1))
+            return;
+
+        var silenceSeconds = (nowUtc - _lastAnySignalUtc).TotalSeconds;
+        var silenceThreshold = Math.Max(30, MaxSilenceSecondsBeforeFallback);
+        if (silenceSeconds < silenceThreshold)
+            return;
+
+        _lastHealthLogUtc = nowUtc;
+        this.LogInfo(
+            $"Signal health: silence={(int)silenceSeconds}s aggr={_aggr.Count} dom={_dom.Count} prices={_prices.Count} " +
+            $"fallbackColdOnly={IndicatorFallbackOnlyWhenOrderflowCold}");
     }
 
     private bool TryComputeTapeProfile(DateTime nowUtc, double tick, out double poc, out double vwap)

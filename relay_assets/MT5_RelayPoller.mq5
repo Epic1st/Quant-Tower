@@ -162,7 +162,7 @@ bool IsSecretConfigured(const string secret)
    StringTrimRight(s);
    if (s == "")
       return false;
-   return (StringCompare(s, "<RELAY_SECRET>", false) != 0);
+   return true;
 }
 
 string LastIdGlobalKey()
@@ -804,7 +804,7 @@ int OnInit()
 {
    if (!IsSecretConfigured(RelaySecret))
    {
-      Print("RelaySecret is missing/placeholder. Set a real shared secret in EA inputs.");
+      Print("RelaySecret is missing. Set RelaySecret in EA inputs.");
       return INIT_PARAMETERS_INCORRECT;
    }
 

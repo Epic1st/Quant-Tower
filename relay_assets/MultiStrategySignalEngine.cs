@@ -362,7 +362,7 @@ public sealed class MultiStrategySignalEngine : Strategy
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
 
         if (!IsSecretConfigured(RelaySecret))
-            this.LogError("RelaySecret is missing or placeholder. Set a real shared secret in strategy settings.");
+            this.LogError("RelaySecret is missing. Set RelaySecret in strategy settings.");
 
         TryInitializeSymbolAndSubscriptions(logWaiting: true);
         if (!_subscriptionsActive)
@@ -2489,9 +2489,7 @@ public sealed class MultiStrategySignalEngine : Strategy
     private static bool IsValid(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
     private static bool IsSecretConfigured(string? secret)
     {
-        if (string.IsNullOrWhiteSpace(secret))
-            return false;
-        return !string.Equals(secret.Trim(), "<RELAY_SECRET>", StringComparison.OrdinalIgnoreCase);
+        return !string.IsNullOrWhiteSpace(secret);
     }
     private static int Clamp(int v, int min, int max) => v < min ? min : v > max ? max : v;
     private static double ClampDouble(double v, double min, double max) => v < min ? min : v > max ? max : v;

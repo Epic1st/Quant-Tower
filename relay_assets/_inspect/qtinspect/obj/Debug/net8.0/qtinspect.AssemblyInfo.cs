@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("qtinspect")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a66d7eeb13c0be19354d9459fc7c056247e50bdc")]
 [assembly: System.Reflection.AssemblyProductAttribute("qtinspect")]
 [assembly: System.Reflection.AssemblyTitleAttribute("qtinspect")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

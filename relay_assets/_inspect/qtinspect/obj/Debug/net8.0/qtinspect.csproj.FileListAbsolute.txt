@@ -12,3 +12,4 @@ D:\Trading-Quantower\relay_assets\_inspect\qtinspect\obj\Debug\net8.0\refint\qti
 D:\Trading-Quantower\relay_assets\_inspect\qtinspect\obj\Debug\net8.0\qtinspect.pdb
 D:\Trading-Quantower\relay_assets\_inspect\qtinspect\obj\Debug\net8.0\qtinspect.genruntimeconfig.cache
 D:\Trading-Quantower\relay_assets\_inspect\qtinspect\obj\Debug\net8.0\ref\qtinspect.dll
+D:\Trading-Quantower\relay_assets\_inspect\qtinspect\obj\Debug\net8.0\qtinspect.sourcelink.json

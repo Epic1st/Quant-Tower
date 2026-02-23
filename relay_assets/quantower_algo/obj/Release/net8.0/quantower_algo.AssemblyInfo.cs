@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("quantower_algo")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+0b8a33fe3c12da99fcace5d6b6fc96b3d41311e0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a66d7eeb13c0be19354d9459fc7c056247e50bdc")]
 [assembly: System.Reflection.AssemblyProductAttribute("quantower_algo")]
 [assembly: System.Reflection.AssemblyTitleAttribute("quantower_algo")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

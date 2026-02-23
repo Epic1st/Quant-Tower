@@ -176,7 +176,7 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
         };
 
         if (!IsSecretConfigured(RelaySecret))
-            this.LogError("RelaySecret is missing or placeholder. Set a real shared secret in strategy settings.");
+            this.LogError("RelaySecret is missing. Set RelaySecret in strategy settings.");
 
         TryInitializeSymbolAndSubscriptions(logWaiting: true);
         if (!_subscriptionsActive)
@@ -1194,9 +1194,7 @@ public sealed class RelaySignal_GoldAbsorption : Strategy
 
     private static bool IsSecretConfigured(string? secret)
     {
-        if (string.IsNullOrWhiteSpace(secret))
-            return false;
-        return !string.Equals(secret.Trim(), "<RELAY_SECRET>", StringComparison.OrdinalIgnoreCase);
+        return !string.IsNullOrWhiteSpace(secret);
     }
 
     private static void TryComputeRobustLevels(List<double> lows, List<double> highs, double tick, out double support, out double resistance)

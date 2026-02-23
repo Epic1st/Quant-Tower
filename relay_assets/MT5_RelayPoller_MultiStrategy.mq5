@@ -3,7 +3,7 @@
 #include <Trade/Trade.mqh>
 
 input string RelayBaseUrl = "http://127.0.0.1:8000";
-input string RelaySecret = "";
+input string RelaySecret = "<RELAY_SECRET>";
 input int PollSeconds = 1;
 input bool PersistLastSignalId = true;
 input bool EnableRelayFailureAlert = true;
@@ -86,7 +86,12 @@ input double RiskS13 = 0.25;
 input long MagicS13 = 260213;
 input string CommentS13 = "S13_MTF_PULL";
 
-input int CooldownSeconds = 20;
+input bool EnableS14 = true;
+input double RiskS14 = 0.25;
+input long MagicS14 = 260214;
+input string CommentS14 = "S14_AGGR_CLUSTER";
+
+input int CooldownSeconds = 10;
 input int MaxSpreadFilter = 120;
 input int MaxSlippage = 100;
 input bool UseTP1TP2 = true;
@@ -96,6 +101,7 @@ input double FallbackFixedLots = 0.01;
 input bool DryRunOnly = false;
 
 input bool UseSignalDirectionOnly = true;
+input bool UseQuantowerSLTP = true;
 input string DirectionOnlyStrategyId = "S1";
 input int GlobalLotMode = 1; // 0 = fixed lots, 1 = risk percent
 input double GlobalFixedLots = 0.01;
@@ -127,6 +133,7 @@ datetime g_last_exec_s10 = 0;
 datetime g_last_exec_s11 = 0;
 datetime g_last_exec_s12 = 0;
 datetime g_last_exec_s13 = 0;
+datetime g_last_exec_s14 = 0;
 
 #define MAX_MANAGED 16
 
@@ -287,7 +294,7 @@ bool IsSecretConfigured(const string secret)
    StringTrimRight(s);
    if (s == "")
       return false;
-   return (StringCompare(s, "<RELAY_SECRET>", false) != 0);
+   return true;
 }
 
 void TrackRelayPollFailure(const string reason)
@@ -797,6 +804,15 @@ bool GetStrategyConfig(const string strategyId, StrategyConfig &cfg)
       return true;
    }
 
+   if (sid == "S14")
+   {
+      cfg.enabled = EnableS14;
+      cfg.riskPercent = RiskS14;
+      cfg.magic = MagicS14;
+      cfg.commentPrefix = CommentS14;
+      return true;
+   }
+
    return false;
 }
 
@@ -829,6 +845,8 @@ datetime GetLastExec(const string strategyId)
       return g_last_exec_s12;
    if (sid == "S13")
       return g_last_exec_s13;
+   if (sid == "S14")
+      return g_last_exec_s14;
    return 0;
 }
 
@@ -861,6 +879,8 @@ void SetLastExec(const string strategyId, datetime ts)
       g_last_exec_s12 = ts;
    else if (sid == "S13")
       g_last_exec_s13 = ts;
+   else if (sid == "S14")
+      g_last_exec_s14 = ts;
 }
 
 string TrimComment(const string commentText)
@@ -893,7 +913,7 @@ bool IsStrategyIdValid(const string sid)
    return (sid == "S1" || sid == "S2" || sid == "S3" ||
            sid == "S4" || sid == "S5" || sid == "S6" ||
            sid == "S7" || sid == "S8" || sid == "S9" ||
-           sid == "S10" || sid == "S11" || sid == "S12" || sid == "S13");
+           sid == "S10" || sid == "S11" || sid == "S12" || sid == "S13" || sid == "S14");
 }
 
 string NormalizeStrategyId(const string rawId)
@@ -1231,7 +1251,7 @@ bool IsKnownMagic(const long magic)
            magic == MagicS4 || magic == MagicS5 || magic == MagicS6 ||
            magic == MagicS7 || magic == MagicS8 || magic == MagicS9 ||
            magic == MagicS10 || magic == MagicS11 || magic == MagicS12 ||
-           magic == MagicS13);
+           magic == MagicS13 || magic == MagicS14);
 }
 
 void ProcessTrailingStops()
@@ -1412,38 +1432,77 @@ bool ExecuteMarketSignal(const int signalId,
 
    if (UseSignalDirectionOnly)
    {
-      int globalSlTicks = PipsToTicks(tradeSymbol, GlobalSLPips, tickSize);
-      if (globalSlTicks > 0)
-         finalSlTicks = globalSlTicks;
-
-      if (finalSlTicks <= 0)
-         finalSlTicks = DefaultSLTicks;
-
-      if (GlobalUseRiskReward)
+      if (UseQuantowerSLTP && slTicks > 0 && tp1Ticks > 0)
       {
-         double rr = GlobalRiskReward;
-         if (rr < 0.2)
-            rr = 0.2;
-         finalTpTicks = (int)MathMax(1.0, MathCeil(finalSlTicks * rr));
+         // Use Quantower's signal SL/TP directly
+         finalSlTicks = slTicks;
+         finalTp1Ticks = tp1Ticks;
+         finalTpTicks = tp2Ticks > 0 ? tp2Ticks : tp1Ticks;
+
+         // Also accept percent-based values from signal if ticks were zero
+         if (slPercent > 0.0 && slTicks <= 0)
+         {
+            int pctTicks = TicksFromPercent(price, slPercent, tickSize);
+            if (pctTicks > 0)
+               finalSlTicks = pctTicks;
+         }
+         if (tp1Percent > 0.0 && tp1Ticks <= 0)
+         {
+            int pctTicks = TicksFromPercent(price, tp1Percent, tickSize);
+            if (pctTicks > 0)
+               finalTp1Ticks = pctTicks;
+         }
+         if (tp2Percent > 0.0 && tp2Ticks <= 0)
+         {
+            int pctTicks = TicksFromPercent(price, tp2Percent, tickSize);
+            if (pctTicks > 0)
+               finalTpTicks = pctTicks;
+         }
+
+         if (finalTpTicks < finalTp1Ticks)
+            finalTpTicks = finalTp1Ticks;
+         if (!UseTP1TP2)
+            finalTp1Ticks = finalTpTicks;
+
+         PrintFormat("Signal id=%d using Quantower SL/TP: sl=%d tp1=%d tp2=%d",
+                     signalId, finalSlTicks, finalTp1Ticks, finalTpTicks);
       }
       else
       {
-         int globalTpTicks = PipsToTicks(tradeSymbol, GlobalTPPips, tickSize);
-         if (globalTpTicks > 0)
-            finalTpTicks = globalTpTicks;
+         // Fallback to EA-calculated GlobalSLPips/GlobalRiskReward
+         int globalSlTicks = PipsToTicks(tradeSymbol, GlobalSLPips, tickSize);
+         if (globalSlTicks > 0)
+            finalSlTicks = globalSlTicks;
+
+         if (finalSlTicks <= 0)
+            finalSlTicks = DefaultSLTicks;
+
+         if (GlobalUseRiskReward)
+         {
+            double rr = GlobalRiskReward;
+            if (rr < 0.2)
+               rr = 0.2;
+            finalTpTicks = (int)MathMax(1.0, MathCeil(finalSlTicks * rr));
+         }
+         else
+         {
+            int globalTpTicks = PipsToTicks(tradeSymbol, GlobalTPPips, tickSize);
+            if (globalTpTicks > 0)
+               finalTpTicks = globalTpTicks;
+         }
+
+         if (finalTpTicks <= 0)
+            finalTpTicks = DefaultTP2Ticks;
+
+         double tp1Frac = GlobalTP1Fraction;
+         if (tp1Frac <= 0.05 || tp1Frac >= 1.0)
+            tp1Frac = 0.5;
+         finalTp1Ticks = (int)MathMax(1.0, MathFloor(finalTpTicks * tp1Frac));
+         if (finalTp1Ticks >= finalTpTicks)
+            finalTp1Ticks = MathMax(1, finalTpTicks - 1);
+         if (!UseTP1TP2)
+            finalTp1Ticks = finalTpTicks;
       }
-
-      if (finalTpTicks <= 0)
-         finalTpTicks = DefaultTP2Ticks;
-
-      double tp1Frac = GlobalTP1Fraction;
-      if (tp1Frac <= 0.05 || tp1Frac >= 1.0)
-         tp1Frac = 0.5;
-      finalTp1Ticks = (int)MathMax(1.0, MathFloor(finalTpTicks * tp1Frac));
-      if (finalTp1Ticks >= finalTpTicks)
-         finalTp1Ticks = MathMax(1, finalTpTicks - 1);
-      if (!UseTP1TP2)
-         finalTp1Ticks = finalTpTicks;
    }
    else
    {
@@ -1580,11 +1639,13 @@ string InferStrategyId(const string payloadStrategyId, const string payloadComme
    if (sid == "S1" || sid == "S2" || sid == "S3" ||
        sid == "S4" || sid == "S5" || sid == "S6" ||
        sid == "S7" || sid == "S8" || sid == "S9" ||
-       sid == "S10" || sid == "S11" || sid == "S12" || sid == "S13")
+       sid == "S10" || sid == "S11" || sid == "S12" || sid == "S13" || sid == "S14")
       return sid;
 
    string c = ToUpperSafe(payloadComment);
-   // Match longer IDs first to avoid "S10/S11/S12/S13" being read as "S1".
+   // Match longer IDs first to avoid "S10/S11/S12/S13/S14" being read as "S1".
+   if (StringFind(c, "S14_") >= 0 || c == "S14")
+      return "S14";
    if (StringFind(c, "S13_") >= 0 || c == "S13")
       return "S13";
    if (StringFind(c, "S12_") >= 0 || c == "S12")
@@ -1784,7 +1845,26 @@ void ProcessSignalPayload(const string body)
 
    if (UseSignalDirectionOnly)
    {
-      PrintFormat("Signal received id=%d strategy=%s side=%s src_symbol=%s trade_symbol=%s mode=direction_only sl_pips=%.1f tp_mode=%s rr=%.2f tp_pips=%.1f lot_mode=%d fixed_lots=%.2f risk_pct=%.2f comment=%s",
+      if (UseQuantowerSLTP)
+      {
+         PrintFormat("Signal received id=%d strategy=%s side=%s src_symbol=%s trade_symbol=%s mode=quantower_sltp sl_ticks=%d tp1_ticks=%d tp2_ticks=%d sl_pct=%.3f tp1_pct=%.3f tp2_pct=%.3f lot_mode=%d comment=%s",
+                     signalId,
+                     strategyId,
+                     side,
+                     sourceSymbol,
+                     tradeSymbol,
+                     slTicks,
+                     tp1Ticks,
+                     tp2Ticks,
+                     slPercent,
+                     tp1Percent,
+                     tp2Percent,
+                     GlobalLotMode,
+                     finalComment);
+      }
+      else
+      {
+         PrintFormat("Signal received id=%d strategy=%s side=%s src_symbol=%s trade_symbol=%s mode=direction_only sl_pips=%.1f tp_mode=%s rr=%.2f tp_pips=%.1f lot_mode=%d fixed_lots=%.2f risk_pct=%.2f comment=%s",
                   signalId,
                   strategyId,
                   side,
@@ -1798,6 +1878,7 @@ void ProcessSignalPayload(const string body)
                   GlobalFixedLots,
                   GlobalRiskPercent,
                   finalComment);
+      }
    }
    else
    {
@@ -1849,7 +1930,7 @@ int OnInit()
 {
    if (!IsSecretConfigured(RelaySecret))
    {
-      Print("RelaySecret is missing/placeholder. Set a real shared secret in EA inputs.");
+      Print("RelaySecret is missing. Set RelaySecret in EA inputs.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -1874,14 +1955,16 @@ int OnInit()
    if (EnableS11) enabledCount++;
    if (EnableS12) enabledCount++;
    if (EnableS13) enabledCount++;
+   if (EnableS14) enabledCount++;
 
-   PrintFormat("Relay poller started. chart_symbol=%s use_chart_symbol=%s strict_gold_only=%s enabled_strategies=%d tp1tp2=%s direction_only=%s lot_mode=%d trailing=%s",
+   PrintFormat("Relay poller started. chart_symbol=%s use_chart_symbol=%s strict_gold_only=%s enabled_strategies=%d tp1tp2=%s direction_only=%s quantower_sltp=%s lot_mode=%d trailing=%s",
                _Symbol,
                (UseChartSymbolForExecution ? "true" : "false"),
                (StrictQuantowerGoldOnly ? "true" : "false"),
                enabledCount,
                (UseTP1TP2 ? "true" : "false"),
                (UseSignalDirectionOnly ? "true" : "false"),
+               (UseQuantowerSLTP ? "true" : "false"),
                GlobalLotMode,
                (EnableGlobalTrailingSL ? "true" : "false"));
    return INIT_SUCCEEDED;
